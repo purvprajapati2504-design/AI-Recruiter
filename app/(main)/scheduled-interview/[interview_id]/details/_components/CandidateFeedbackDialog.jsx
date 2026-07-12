@@ -180,6 +180,28 @@ export default function CandidateFeedbackDialog({candidate = {}}) {
                     </p>
                   </div>
 
+                  {feedback?.strengths && feedback.strengths.length > 0 && (
+                    <div className="p-4 bg-green-50 rounded-md">
+                      <div className="font-semibold text-green-700 mb-2">Strengths</div>
+                      <ul className="text-sm text-gray-700 list-disc list-inside">
+                        {feedback.strengths.map((strength, i) => (
+                          <li key={i}>{strength}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {feedback?.weaknesses && feedback.weaknesses.length > 0 && (
+                    <div className="p-4 bg-red-50 rounded-md">
+                      <div className="font-semibold text-red-700 mb-2">Areas for Improvement</div>
+                      <ul className="text-sm text-gray-700 list-disc list-inside">
+                        {feedback.weaknesses.map((weakness, i) => (
+                          <li key={i}>{weakness}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
                   <div
                     className={`p-4 rounded-md ${
                       feedback?.recommendation === false ? "bg-red-50" : "bg-green-50"
@@ -198,6 +220,50 @@ export default function CandidateFeedbackDialog({candidate = {}}) {
                   </div>
                 </div>
               </div>
+
+              {feedback?.questionAnalysis && feedback.questionAnalysis.length > 0 && (
+                <div className="space-y-4">
+                  <div className="font-semibold text-primary">Question-by-Question Analysis</div>
+                  <div className="space-y-3 max-h-96 overflow-y-auto">
+                    {feedback.questionAnalysis.map((qa, i) => (
+                      <div key={i} className="p-4 bg-secondary rounded-md space-y-2">
+                        <div className="flex justify-between items-start">
+                          <div className="font-medium text-sm">Q{qa.questionNumber || i + 1}</div>
+                          <div className="text-sm font-bold text-primary">{qa.rating || 0}/10</div>
+                        </div>
+                        <div className="text-xs text-gray-600">
+                          <div className="font-medium">Question:</div>
+                          <div className="truncate">{qa.question || "N/A"}</div>
+                        </div>
+                        <div className="text-xs text-gray-600">
+                          <div className="font-medium">Answer:</div>
+                          <div className="line-clamp-2">{qa.answer || "N/A"}</div>
+                        </div>
+                        <div className="text-xs text-gray-700">
+                          <div className="font-medium">Feedback:</div>
+                          <div>{qa.feedback || "No feedback provided."}</div>
+                        </div>
+                        {qa.strengths && qa.strengths.length > 0 && (
+                          <div className="text-xs">
+                            <div className="font-medium text-green-700">Strengths:</div>
+                            <ul className="list-disc list-inside text-gray-700">
+                              {qa.strengths.map((s, si) => <li key={si}>{s}</li>)}
+                            </ul>
+                          </div>
+                        )}
+                        {qa.weaknesses && qa.weaknesses.length > 0 && (
+                          <div className="text-xs">
+                            <div className="font-medium text-red-700">Areas to Improve:</div>
+                            <ul className="list-disc list-inside text-gray-700">
+                              {qa.weaknesses.map((w, wi) => <li key={wi}>{w}</li>)}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               <div className="flex items-center justify-end">
                 <Button
