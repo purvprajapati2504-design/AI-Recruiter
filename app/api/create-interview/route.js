@@ -22,6 +22,8 @@ function serializeError(err) {
 export async function POST(req) {
   try {
     const body = await req.json().catch(() => ({}));
+    console.log("Request body:", body);
+
     if (!body || typeof body !== "object") {
       return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
     }
@@ -31,9 +33,12 @@ export async function POST(req) {
       : Array.isArray(body.questionList) ? body.questionList
       : Array.isArray(body.questions) ? body.questions
       : null;
+    const resume = body.resume ?? null;
 
-    if (!userEmail || !rawQuestions || rawQuestions.length === 0) {
-      return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
+    console.log("Extracted fields:", { userEmail, questionsCount: rawQuestions?.length, resume });
+
+    if (!userEmail || !rawQuestions || rawQuestions.length === 0 || !resume) {
+      return NextResponse.json({ error: "Missing required fields (userEmail, questions, resume)" }, { status: 400 });
     }
 
     const cleanQuestions = rawQuestions.map((q, i) => {
@@ -49,6 +54,7 @@ export async function POST(req) {
       questionlist: cleanQuestions,
       useremail: userEmail,
       interview_id: body.interview_id || randomUUID(),
+      resume: body.resume ?? null,
       created_at: new Date().toISOString()
     };
 
@@ -59,19 +65,24 @@ export async function POST(req) {
     while (attempt < maxAttempts) {
       attempt += 1;
       try {
+        console.log("Inserting payload to database:", payload);
         const { data, error } = await supabase
           .from("Interviews")
           .insert(payload)
           .select()
           .single();
 
+        console.log("Database insert result:", { data, error });
+
         if (error) {
+          console.error("Database insert error:", error);
           return NextResponse.json({ error: "Database insert failed", detail: serializeError(error) }, { status: 500 });
         }
 
         return NextResponse.json({ data }, { status: 200 });
       } catch (e) {
         lastError = e;
+        console.error("Database insert exception:", e);
         const errMsg = String(e?.message ?? e);
         const isTimeout = /timeout/i.test(errMsg) || /ConnectTimeoutError/i.test(errMsg);
         if (!isTimeout || attempt >= maxAttempts) break;

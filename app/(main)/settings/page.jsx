@@ -81,8 +81,8 @@ export default function SettingsPage() {
           meta.nickname ||
           (authUser.email ? authUser.email.split("@")[0] : "users"),
         email: authUser.email ?? "",
-        picture: meta.avatar_url || meta.picture || "/default-avatar.png",
-        credits: 0,
+        picture: meta.avatar_url || meta.picture || fallbackSvgDataUri,
+        credits: 3,
       };
 
       setUser((prev) => ({ ...(prev || {}), ...fallbackUser }));
@@ -92,20 +92,24 @@ export default function SettingsPage() {
 
       const { data: profile } = await supabase
         .from("users")
-        .select("id, full_name, email, avatar_url, credits")
+        .select("id, name, email, picture, credits")
         .eq("id", authUser.id)
         .maybeSingle();
+
+      console.log("Settings - profile from database:", profile);
 
       if (!mounted) return;
 
       if (profile) {
         const merged = {
           id: profile.id,
-          name: profile.full_name ?? fallbackUser.name,
+          name: profile.name ?? fallbackUser.name,
           email: profile.email ?? fallbackUser.email,
-          picture: profile.avatar_url ?? fallbackUser.picture,
-          credits: profile.credits ?? 0,
+          picture: profile.picture ?? fallbackUser.picture,
+          credits: profile.credits ?? 3,
         };
+
+        console.log("Settings - merged user:", merged);
 
         setUser((prev) => ({ ...(prev || {}), ...merged }));
         setName(merged.name);
@@ -145,14 +149,14 @@ export default function SettingsPage() {
           (authUser.email ? authUser.email.split("@")[0] : "User"),
         email: authUser.email ?? "",
         picture: meta.avatar_url || meta.picture || "/default-avatar.png",
-        credits: 0,
+        credits: 3,
       };
 
       setUser((prev) => ({ ...(prev || {}), ...fallbackUser }));
       setName(fallbackUser.name);
       setEmail(fallbackUser.email);
       setAvatarPreview(fallbackUser.picture);
-      setCredits(0);
+      setCredits(fallbackUser.credits);
     });
 
     return () => {
@@ -215,12 +219,11 @@ export default function SettingsPage() {
       const { data, error } = await supabase
         .from("users")
         .update({
-          full_name: name.trim(),
-          avatar_url: avatarUrl,
-          updated_at: new Date().toISOString(),
+          name: name.trim(),
+          picture: avatarUrl,
         })
         .eq("id", user.id)
-        .select("id, full_name, email, avatar_url, credits")
+        .select("id, name, email, picture, credits")
         .maybeSingle();
 
       if (error) {
@@ -232,9 +235,9 @@ export default function SettingsPage() {
       if (data) {
         const merged = {
           id: data.id,
-          name: data.full_name ?? name.trim(),
+          name: data.name ?? name.trim(),
           email: data.email ?? email,
-          picture: data.avatar_url ?? avatarUrl,
+          picture: data.picture ?? avatarUrl,
           credits: data.credits ?? credits,
         };
 

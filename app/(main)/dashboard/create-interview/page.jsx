@@ -37,6 +37,10 @@ function CreateInterview() {
       toast("Please enter all details");
       return;
     }
+    if (!formdata?.resume) {
+      toast("Please upload your resume");
+      return;
+    }
     setStep(step + 1);
   };
 

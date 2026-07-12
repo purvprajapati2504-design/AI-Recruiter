@@ -262,10 +262,54 @@ export default function QuestionList({ formdata, onCreateLink }) {
       return;
     }
 
+    if (!formdata?.resume) {
+      toast("Resume is required");
+      return;
+    }
+
     setSaving(true);
     const interview_id = uuidv4();
 
     try {
+      let resumeUrl = null;
+
+      // Upload resume to Supabase Storage if provided
+      if (formdata?.resume instanceof File) {
+        try {
+          const { supabase } = await import("@/lib/services/supabaseClient");
+          const fileName = `${user.id}/${interview_id}/${formdata.resume.name}`;
+          console.log("Uploading resume to:", fileName);
+          
+          const { data: uploadData, error: uploadError } = await supabase.storage
+            .from('resumes')
+            .upload(fileName, formdata.resume);
+
+          console.log("Resume upload result:", { uploadData, uploadError });
+
+          if (uploadError) {
+            console.error("Resume upload error:", uploadError);
+            toast("Failed to upload resume: " + uploadError.message);
+            setSaving(false);
+            return;
+          } else {
+            const { data: { publicUrl } } = supabase.storage
+              .from('resumes')
+              .getPublicUrl(fileName);
+            resumeUrl = publicUrl;
+            console.log("Resume public URL:", resumeUrl);
+          }
+        } catch (uploadErr) {
+          console.error("Resume upload exception:", uploadErr);
+          toast("Failed to upload resume: " + uploadErr.message);
+          setSaving(false);
+          return;
+        }
+      } else {
+        toast("Resume file is required");
+        setSaving(false);
+        return;
+      }
+
       const res = await fetch("/api/create-interview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -277,6 +321,7 @@ export default function QuestionList({ formdata, onCreateLink }) {
           questionlist: questionList,
           useremail: user.email,
           interview_id,
+          resume: resumeUrl,
         }),
       });
 
@@ -287,6 +332,10 @@ export default function QuestionList({ formdata, onCreateLink }) {
       } catch {
         payload = { raw: text };
       }
+
+      console.log("API Response status:", res.status);
+      console.log("API Response text:", text);
+      console.log("API Response payload:", payload);
 
       if (!res.ok) {
         const serverMsg = payload?.error || payload?.message || "Create interview failed";

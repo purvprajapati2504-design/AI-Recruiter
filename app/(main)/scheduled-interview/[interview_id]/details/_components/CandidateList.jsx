@@ -17,7 +17,7 @@ function CandidateList({ candidateList = [] }) {
 
         const rating = parsedFeedback?.feedback?.rating || {};
         const averageRating = Math.round(
-          ((rating.technicalSkills || 0) + (rating.communication || 0) + (rating.problemSolving || 0) + (rating.experience || 0)) / 4
+          ((rating.technicalSkills || 0) + (rating.communication || 0) + (rating.problemSolving || 0) + (rating.experience || 0) + (rating.confidence || 0) + (rating.overall || 0)) / 6
         );
 
         return (

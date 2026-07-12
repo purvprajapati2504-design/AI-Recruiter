@@ -184,13 +184,32 @@ export default function StartInterview() {
   const [connectionStatus, setConnectionStatus] = useState("idle");
 
   const conversationRef = useRef([]);
+  // Stores the full VAPI conversation-update messages (most reliable source)
+  const vapiFullConversationRef = useRef([]);
+  // Stores structured Q&A pairs: { question, answer, questionIndex }
+  const qaCollectionRef = useRef([]);
+  // Tracks index of the last assistant question asked
+  const lastQuestionIndexRef = useRef(-1);
 
 const compressConversationForFeedback = useCallback((conversation, maxPairs = 12) => {
+  // --- STRATEGY 1: Use structured Q&A pairs collected from question list matching ---
+  const structuredPairs = qaCollectionRef.current ?? [];
+  if (structuredPairs.length > 0) {
+    return structuredPairs
+      .filter(p => p.question && p.answer && p.answer.trim().length > 0)
+      .slice(-maxPairs)
+      .map(p => ({ question: p.question, answer: p.answer, audioUrl: null }));
+  }
+
+  // --- STRATEGY 2: Use full VAPI conversation-update messages if available ---
+  const fullMsgs = vapiFullConversationRef.current ?? [];
+  const sourceConversation = fullMsgs.length > 0 ? fullMsgs : (Array.isArray(conversation) ? conversation : []);
+
   const pairs = [];
   let lastQuestion = null;
-  if (!Array.isArray(conversation) || conversation.length === 0) return [];
+  if (!Array.isArray(sourceConversation) || sourceConversation.length === 0) return [];
 
-  const normalized = conversation.map((msg) => {
+  const normalized = sourceConversation.map((msg) => {
     const roleRaw = msg?.role ?? msg?.speaker ?? msg?.from ?? "";
     const role = String(roleRaw).toLowerCase();
     const content =
@@ -201,15 +220,19 @@ const compressConversationForFeedback = useCallback((conversation, maxPairs = 12
   });
 
   for (const msg of normalized) {
-    if ((msg.role && (msg.role.includes("assistant") || msg.role.includes("ai") || msg.role.includes("bot") || msg.role.includes("system"))) && msg.content) {
+    // Skip very short assistant greetings/acks (< 40 chars) to avoid pairing filler
+    const isAssistant = msg.role && (msg.role.includes("assistant") || msg.role.includes("ai") || msg.role.includes("bot") || msg.role.includes("system"));
+    const isUser = msg.role && (msg.role.includes("user") || msg.role.includes("candidate") || msg.role.includes("participant") || msg.role.includes("caller"));
+
+    if (isAssistant && msg.content && msg.content.length >= 20) {
       lastQuestion = msg.content;
       continue;
     }
 
-    if (msg.role && (msg.role.includes("user") || msg.role.includes("candidate") || msg.role.includes("participant") || msg.role.includes("caller"))) {
+    if (isUser) {
       const answer = msg.content;
-      if ((lastQuestion && lastQuestion.length > 0) || msg.audioUrl || (answer && answer.length > 0)) {
-        pairs.push({ question: lastQuestion ?? "", answer, audioUrl: msg.audioUrl });
+      if (lastQuestion || msg.audioUrl || (answer && answer.length > 0)) {
+        pairs.push({ question: lastQuestion ?? "", answer: answer ?? "", audioUrl: msg.audioUrl });
       }
       lastQuestion = null;
       continue;
@@ -222,16 +245,6 @@ const compressConversationForFeedback = useCallback((conversation, maxPairs = 12
         audioUrl: msg.raw.audioUrl ?? msg.raw.audio_url ?? null
       });
       lastQuestion = null;
-      continue;
-    }
-  }
-
-  if (pairs.length === 0) {
-    const textBlob = normalized.map(n => n.content).join("\n\n");
-    const qARegex = /Q\d*[:.\-]?\s*(.+?)\r?\n\s*A\d*[:.\-]?\s*(.+?)(?=(?:\r?\nQ\d*[:.\-]|\r?\n$))/gims;
-    let m;
-    while ((m = qARegex.exec(textBlob)) && pairs.length < maxPairs) {
-      pairs.push({ question: m[1].trim(), answer: m[2].trim(), audioUrl: null });
     }
   }
 
@@ -242,19 +255,126 @@ const compressConversationForFeedback = useCallback((conversation, maxPairs = 12
   return filtered.slice(-maxPairs);
 }, []);
 
+function extractJsonFromResponse(content) {
+  if (!content || typeof content !== "string") return null;
+  try {
+    const parsed = JSON.parse(content.trim());
+    if (parsed?.feedback) return parsed;
+  } catch (e) {}
+  const codeBlockMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (codeBlockMatch) {
+    try {
+      const parsed = JSON.parse(codeBlockMatch[1].trim());
+      if (parsed?.feedback) return parsed;
+    } catch (e) {}
+  }
+  const jsonMatch = content.match(/\{[\s\S]*?"feedback"[\s\S]*?\}/i);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]);
+      if (parsed?.feedback) return parsed;
+    } catch (e) {
+      try {
+        const cleaned = jsonMatch[0].replace(/\\"/g, '"').replace(/\\n/g, '');
+        const parsed2 = JSON.parse(cleaned);
+        if (parsed2?.feedback) return parsed2;
+      } catch (e2) {}
+    }
+  }
+  return null;
+}
+
 const generateFeedbackAndSave = useCallback(async () => {
   const finalConversation = Array.isArray(conversationRef.current) ? conversationRef.current : [];
 
-  const makeFallbackTemplate = (msg = "No conversation pairs were provided.") => ({
-    feedback: {
-      rating: { technicalSkills: 0, communication: 0, problemSolving: 0, experience: 0 },
-      summary: msg,
-      recommendation: false,
-      recommendationMsg: "Fallback: AI not available or returned no usable content.",
-      rawConversation: finalConversation,
-      rawAiResponse: null
+  const makeFallbackTemplate = (msg = "No conversation pairs were provided.", pairs = []) => {
+    // Derive real metrics from actual Q&A pairs
+    const totalQuestions = pairs.length || 0;
+    const answeredPairs = pairs.filter(p => String(p.answer ?? "").trim().length > 15);
+    const answeredQuestions = answeredPairs.length;
+    const answerRate = totalQuestions > 0 ? answeredQuestions / totalQuestions : 0;
+
+    // Compute avg answer length as proxy for detail/depth
+    const avgAnswerLen = answeredPairs.length > 0
+      ? answeredPairs.reduce((sum, p) => sum + String(p.answer ?? "").trim().length, 0) / answeredPairs.length
+      : 0;
+
+    // Score helper: maps answer rate + depth to a 0-10 score
+    const score = (base, bonus = 0) => {
+      const raw = Math.round(base * 6 + bonus);
+      return Math.min(10, Math.max(1, raw));
+    };
+
+    const depthBonus = avgAnswerLen > 300 ? 2 : avgAnswerLen > 150 ? 1 : 0;
+
+    const technicalSkills = score(answerRate, depthBonus);
+    const communication   = score(answerRate, depthBonus > 0 ? depthBonus - 1 : 0);
+    const problemSolving  = score(answerRate, depthBonus);
+    const experience      = score(answerRate, 0);
+    const confidence      = score(answerRate, depthBonus > 0 ? 1 : 0);
+    const overall         = Math.round((technicalSkills + communication + problemSolving + experience + confidence) / 5);
+
+    const recommendation = answerRate >= 0.6 && overall >= 5;
+
+    // Build dynamic summary from actual data
+    const summary = totalQuestions === 0
+      ? "No interview conversation was recorded. The session may have ended before any questions were answered."
+      : answeredQuestions === 0
+        ? `The candidate did not provide answers to any of the ${totalQuestions} interview questions asked.`
+        : `The candidate answered ${answeredQuestions} out of ${totalQuestions} questions. ${
+            answerRate >= 0.8
+              ? "Most questions received detailed responses showing good preparation."
+              : answerRate >= 0.5
+                ? "Some questions were answered adequately, though several lacked depth or were skipped."
+                : "The majority of questions were not answered or received minimal responses."
+          } ${
+            avgAnswerLen > 300
+              ? "Answers were generally detailed and well-elaborated."
+              : avgAnswerLen > 150
+                ? "Answers were of moderate length and detail."
+                : "Answers tended to be brief or incomplete."
+          }`;
+
+    const strengths = [];
+    const weaknesses = [];
+
+    if (answeredQuestions > 0) {
+      if (answerRate >= 0.8) strengths.push("Answered the majority of interview questions");
+      if (avgAnswerLen > 300) strengths.push("Provided detailed and comprehensive answers");
+      if (avgAnswerLen > 150) strengths.push("Demonstrated ability to articulate responses clearly");
+      if (communication >= 6) strengths.push("Showed good communication throughout the interview");
+      if (technicalSkills >= 6) strengths.push("Displayed relevant technical knowledge");
     }
-  });
+    if (strengths.length === 0) strengths.push("Participated in the interview session");
+
+    if (answerRate < 0.6) weaknesses.push("Many questions were left unanswered or skipped");
+    if (avgAnswerLen < 100 && answeredQuestions > 0) weaknesses.push("Answers lacked sufficient depth and detail");
+    if (communication < 5) weaknesses.push("Needs improvement in structuring responses");
+    if (technicalSkills < 5) weaknesses.push("Technical knowledge could be strengthened further");
+    if (weaknesses.length === 0 && overall < 8) weaknesses.push("Could provide more specific examples in answers");
+
+    const recommendationMsg = recommendation
+      ? `Candidate answered ${answeredQuestions}/${totalQuestions} questions with an overall score of ${overall}/10. Recommended for further consideration.`
+      : `Candidate answered ${answeredQuestions}/${totalQuestions} questions with an overall score of ${overall}/10. Further review recommended before proceeding.`;
+
+    return {
+      feedback: {
+        rating: { technicalSkills, communication, problemSolving, experience, confidence, overall },
+        summary,
+        strengths,
+        weaknesses,
+        overallFeedback: summary,
+        recommendation,
+        recommendationMsg,
+        interviewStatus: "Completed",
+        totalQuestions,
+        answeredQuestions,
+        rawConversation: finalConversation,
+        rawAiResponse: msg,
+        generatedAt: new Date().toISOString()
+      }
+    };
+  };
 
   const normalizeForStorage = (obj, defaults = {}) => {
     let out;
@@ -294,7 +414,7 @@ const generateFeedbackAndSave = useCallback(async () => {
       if (error) {
         console.error("Supabase insert error:", error);
   
-        const fallback = makeFallbackTemplate("Supabase insert failed; saved fallback.");
+        const fallback = makeFallbackTemplate("Supabase insert failed; saved fallback.", pairs ?? []);
         try {
           await supabase.from("interview_feedback").insert([{ user_name: payload.user_name, user_email: payload.user_email, interview_id: payload.interview_id, feedback: fallback, recommended: false }]);
         } catch (fbErr) {
@@ -304,7 +424,7 @@ const generateFeedbackAndSave = useCallback(async () => {
       return data ?? null;
     } catch (e) {
       console.error("Unexpected insert error:", e);
-      const fallback = makeFallbackTemplate("Unexpected insert error; saved fallback.");
+      const fallback = makeFallbackTemplate("Unexpected insert error; saved fallback.", pairs ?? []);
       try {
         await supabase.from("interview_feedback").insert([{ user_name: interviewInfo?.userName ?? "", user_email: interviewInfo?.userEmail ?? "", interview_id: interview_id ?? null, feedback: fallback, recommended: false }]);
       } catch (ignored) {
@@ -315,14 +435,14 @@ const generateFeedbackAndSave = useCallback(async () => {
   };
 
   if (!finalConversation.length) {
-    const fallback = makeFallbackTemplate();
+    const fallback = makeFallbackTemplate("No conversation was recorded.", []);
     await insertToSupabase(fallback);
     return;
   }
 
   const pairs = compressConversationForFeedback(finalConversation, 12);
   if (!pairs.length) {
-    const fallback = makeFallbackTemplate("Captured conversation but no Q&A pairs found.");
+    const fallback = makeFallbackTemplate("Captured conversation but no Q&A pairs found.", []);
     await insertToSupabase(normalizeForStorage(fallback));
     return;
   }
@@ -359,36 +479,20 @@ const generateFeedbackAndSave = useCallback(async () => {
     }
 
     if (!feedbackObj) {
-      const answeredCount = pairs.filter(p => (p.answer ?? "").trim().length > 10 || p.audioUrl).length;
-      const totalCount = pairs.length || 1;
-      const answerRate = answeredCount / totalCount;
-      const scoreFromRate = (rate) => {
-        const s = Math.round(Math.min(10, Math.max(0, Math.round(rate * 10))));
-        return s;
-      };
-      feedbackObj = {
-        feedback: {
-          rating: {
-            technicalSkills: scoreFromRate(answerRate),
-            communication: scoreFromRate(answerRate),
-            problemSolving: scoreFromRate(answerRate),
-            experience: scoreFromRate(answerRate)
-          },
-          summary: `Captured ${pairs.length} Q&A pairs; local scoring applied because AI parsing failed.`,
-          recommendation: answerRate >= 0.6,
-          recommendationMsg: answerRate >= 0.6 ? `Candidate answered ${answeredCount} of ${totalCount} questions.` : "Candidate provided limited responses. Re-run interview or inspect raw data."
-        },
-        rawConversation: finalConversation,
-        debug: { pairs }
-      };
+      // AI parsing failed — compute real scores from actual Q&A pairs
+      feedbackObj = makeFallbackTemplate("AI response could not be parsed; local scoring applied.", pairs);
     }
 
-    const normalized = normalizeForStorage(feedbackObj, { rawConversation: finalConversation, rawAiResponse, debug: { pairs } });
-
-    await insertToSupabase(normalized);
+    if (!json?.saved) {
+      const normalized = normalizeForStorage(feedbackObj, { rawConversation: finalConversation, rawAiResponse, debug: { pairs } });
+      await insertToSupabase(normalized);
+    } else {
+      console.log("Feedback was already saved to database by server.");
+    }
   } catch (err) {
     console.error("AI feedback generation error:", err);
-    const fallback = makeFallbackTemplate("AI feedback generation error; saved fallback.");
+    const currentPairs = compressConversationForFeedback(finalConversation, 12);
+    const fallback = makeFallbackTemplate("AI feedback generation error; local scoring applied.", currentPairs);
     await insertToSupabase(normalizeForStorage(fallback));
   }
 }, [compressConversationForFeedback, interviewInfo, interview_id, supabase]);
@@ -421,7 +525,8 @@ const generateFeedbackAndSave = useCallback(async () => {
         safeSetState(setConnectionStatus, "connected");
       });
 
-      const onCallEnd = safeHandler(() => {
+      const onCallEnd = safeHandler((data) => {
+        console.log("Vapi call ended:", data);
         callStateRef.current.isConnecting = false;
         callStateRef.current.isConnected = false;
         callStateRef.current.callId = null;
@@ -429,6 +534,12 @@ const generateFeedbackAndSave = useCallback(async () => {
         safeSetState(setAiSpeaking, false);
         safeSetState(setUserSpeaking, false);
         safeSetState(setConnectionStatus, "idle");
+        
+        // Check if this was an ejection
+        if (data?.endReason === "ejection" || data?.reason === "ejection") {
+          console.warn("Vapi call was ejected:", data);
+          toast.warning("Interview ended unexpectedly. Please try again.");
+        }
       });
 
       const onSpeechStart = safeHandler(() => {
@@ -445,44 +556,74 @@ const generateFeedbackAndSave = useCallback(async () => {
           const role = msg?.role ?? "";
           const transcriptType = msg?.transcriptType ?? "";
 
+          // --- User speech transcript (final only) ---
           if (type === "transcript" && role === "user") {
             const transcript = String(msg?.transcript ?? "").trim();
             if (transcriptType === "partial") {
               safeSetState(setUserSpeaking, true);
-              if (userSpeakingTimeoutRef.current) {
-                clearTimeout(userSpeakingTimeoutRef.current);
-              }
+              if (userSpeakingTimeoutRef.current) clearTimeout(userSpeakingTimeoutRef.current);
               userSpeakingTimeoutRef.current = setTimeout(() => {
-                if (isMountedRef.current && !isCleaningUpRef.current) {
-                  safeSetState(setUserSpeaking, false);
-                }
+                if (isMountedRef.current && !isCleaningUpRef.current) safeSetState(setUserSpeaking, false);
               }, 1000);
             } else if (transcriptType === "final" && transcript) {
               safeSetState(setUserSpeaking, false);
               conversationRef.current.push({ role: "user", content: transcript });
+
+              // Match user answer to the known question list
+              const questionList = questions ?? [];
+              const qIdx = lastQuestionIndexRef.current;
+              if (qIdx >= 0 && qIdx < questionList.length) {
+                const knownQuestion = questionList[qIdx]?.question ?? "";
+                // Either update existing entry or push new
+                const existing = qaCollectionRef.current.find(p => p.questionIndex === qIdx);
+                if (existing) {
+                  existing.answer = (existing.answer ? existing.answer + " " : "") + transcript;
+                } else {
+                  qaCollectionRef.current.push({ question: knownQuestion, answer: transcript, questionIndex: qIdx });
+                }
+              }
             }
           }
 
+          // --- Assistant speech transcript (final only) ---
           if (type === "transcript" && role === "assistant") {
             const transcript = String(msg?.transcript ?? "").trim();
             if (transcriptType === "final" && transcript) {
               conversationRef.current.push({ role: "assistant", content: transcript });
+
+              // Detect which known question the assistant is asking
+              const questionList = questions ?? [];
+              for (let i = 0; i < questionList.length; i++) {
+                const qText = String(questionList[i]?.question ?? "").toLowerCase();
+                // Match if assistant transcript contains significant portion of the question
+                const words = qText.split(/\s+/).filter(w => w.length > 4);
+                const matchCount = words.filter(w => transcript.toLowerCase().includes(w)).length;
+                if (words.length > 0 && matchCount / words.length >= 0.5) {
+                  lastQuestionIndexRef.current = i;
+                  break;
+                }
+              }
             }
           }
 
+          // --- conversation-update: capture VAPI's full authoritative message list ---
           if (type === "conversation-update") {
             const messages = msg?.conversation ?? msg?.messages ?? [];
             if (Array.isArray(messages) && messages.length > 0) {
+              // Store the full snapshot — always overwrite with latest
+              vapiFullConversationRef.current = messages.map(m => ({
+                role: String(m?.role ?? "").toLowerCase(),
+                content: String(m?.content ?? m?.message ?? "").trim()
+              })).filter(m => m.role && m.content);
+
+              // Also keep conversationRef in sync (dedup)
               const lastMsg = messages[messages.length - 1];
-              if (lastMsg && lastMsg.role && lastMsg.content) {
+              if (lastMsg?.role && lastMsg?.content) {
                 const isDuplicate = conversationRef.current.some(
                   m => m.role === lastMsg.role && m.content === lastMsg.content
                 );
                 if (!isDuplicate) {
-                  conversationRef.current.push({
-                    role: lastMsg.role,
-                    content: String(lastMsg.content).trim()
-                  });
+                  conversationRef.current.push({ role: lastMsg.role, content: String(lastMsg.content).trim() });
                 }
               }
             }
@@ -687,14 +828,17 @@ const generateFeedbackAndSave = useCallback(async () => {
     const qArray = questions ?? [];
     const questionsString = qArray.map((q, idx) => `${idx + 1}. ${q.question}`).filter(Boolean).join("\n");
 
-    const vapiOptions = {
+   const vapiOptions = {
   name: "AI Recruiter",
+
   firstMessage: `Hi ${interviewInfo?.userName ?? "candidate"}, ready for your interview?`,
+
   firstMessageMode: "assistant-speaks-first",
+
   transcriber: {
     provider: "deepgram",
     model: "nova-2",
-    language: "en-US"
+    language: "multi"
   },
 
   startSpeakingPlan: {
@@ -705,25 +849,112 @@ const generateFeedbackAndSave = useCallback(async () => {
     numWords: 2,
     voiceSeconds: 0.35,
     backoffSeconds: 0.8,
-    acknowledgementPhrases: ["yeah", "yes", "ok", "okay", "right", "mm-hmm"]
+    acknowledgementPhrases: [
+      "yeah",
+      "yes",
+      "ok",
+      "okay",
+      "right",
+      "mm-hmm",
+      "haan",
+      "ha",
+      "ji",
+      "achu",
+      "haa",
+      "thik",
+      "theek",
+      "sahi",
+      "correct",
+      "hmm"
+    ]
   },
 
+  // Match your Vapi Voice Settings
   voice: {
-    provider: "openai",
-    voiceId: "alloy",
-    speed: 0.90,
-    fallbackPlan: {
-      voices: [{ provider: "azure", voiceId: "en-US-JennyNeural" }]
-    }
+    provider: "vapi",
+    voiceId: "Elliot",
+    version: "2",
+    language: "auto",
+    speed: 0.95
   },
 
   model: {
     provider: "openai",
     model: "gpt-4o-mini",
-    messages: [{
-      role: "system",
-      content: `You are an AI voice assistant conducting interviews. Ask one question at a time and wait for the candidate's response. Keep each question under 20 words. Below are the questions:\n${questionsString}`.trim()
-    }]
+
+    messages: [
+      {
+        role: "system",
+        content: `IDENTITY
+You are a friendly, professional AI interviewer fluent in English, Hindi, and Gujarati.
+
+====================
+LANGUAGE CAPABILITIES
+====================
+You can:
+- UNDERSTAND mixed languages (Hinglish, Gujlish, any combination of H+G+E)
+- SPEAK in the same language as the candidate
+- TRANSLATE between languages when helpful
+- SWITCH languages naturally based on context
+
+====================
+LANGUAGE DETECTION & RESPONSE
+====================
+1. Detect the candidate's language preference from their first response
+2. If they speak Hinglish (Hindi+English mix), respond in Hinglish
+3. If they speak Gujlish (Gujarati+English mix), respond in Gujlish
+4. If they speak pure Hindi, respond in Hindi
+5. If they speak pure Gujarati, respond in Gujarati
+6. If they speak pure English, respond in English
+7. If unsure, ask: "Would you like to continue in Hindi, Gujarati, or English?"
+8. Once language is set, stick to it unless candidate switches
+
+====================
+TRANSLATION RULES
+====================
+- If candidate asks in Hindi, answer in Hindi
+- If candidate asks in Gujarati, answer in Gujarati
+- If candidate asks in English, answer in English
+- If candidate mixes languages, mirror their mix
+- Only translate if candidate explicitly asks for translation
+- Provide translations in parentheses if helpful for clarity
+
+====================
+INTERVIEW RULES
+====================
+- Ask only ONE interview question at a time
+- Wait for the complete answer
+- Never ask two questions together
+- Never answer interview questions for the candidate
+- If candidate asks for clarification, explain briefly in their language
+- After receiving an answer, acknowledge and ask the next question
+- After the final question, thank the candidate and end the interview politely
+
+====================
+VOICE STYLE
+====================
+- Speak naturally and confidently
+- Speak clearly at a slightly slower pace
+- Use short sentences
+- Avoid long paragraphs
+- Repeat important information once if necessary
+- Match the candidate's speaking style
+
+====================
+SAFETY
+====================
+- Never invent information
+- Ask for clarification when needed
+- Never claim to perform actions you cannot perform
+
+====================
+INTERVIEW QUESTIONS
+====================
+Below are the questions to ask. Adapt them to the candidate's language:
+
+${questionsString}`.trim()
+      }
+    ]
   }
 };
 

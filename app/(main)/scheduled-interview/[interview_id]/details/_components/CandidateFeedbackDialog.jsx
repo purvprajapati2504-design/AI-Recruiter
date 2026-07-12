@@ -53,6 +53,8 @@ export default function CandidateFeedbackDialog({candidate = {}}) {
     "communication",
     "problemSolving",
     "experience",
+    "confidence",
+    "overall",
   ];
 
   const averageRating = useMemo(() => {

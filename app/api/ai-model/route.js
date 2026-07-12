@@ -16,45 +16,6 @@ function safeText(v) {
   return String(v ?? "").trim();
 }
 
-function fallbackQuestions(jobPosition, type) {
-  const title = safeText(jobPosition) || "this role";
-  const interviewType = safeText(type).toLowerCase();
-
-  const technical = [
-    `Can you explain the core Java concepts you use most often in ${title}?`,
-    `How do you debug and fix a bug in a Java application?`,
-    `What is the difference between ArrayList and LinkedList in Java?`,
-    `How do you handle exceptions in Java code?`,
-  ];
-
-  const behavioral = [
-    `Tell me about a time you solved a difficult problem in a team.`,
-    `How do you handle deadlines when multiple tasks are pending?`,
-    `Describe a situation where you learned a new skill quickly.`,
-    `How do you handle feedback from a senior developer or interviewer?`,
-  ];
-
-  const problemSolving = [
-    `How would you approach a performance issue in a Java application?`,
-    `How would you design a simple solution for a real-world business problem?`,
-    `What steps do you take when your code works locally but fails in production?`,
-    `How do you break down a complex task into smaller parts?`,
-  ];
-
-  let selected = technical;
-  if (interviewType.includes("behavior")) selected = behavioral;
-  else if (interviewType.includes("problem")) selected = problemSolving;
-
-  return selected.slice(0, 4).map((question) => ({
-    question,
-    type:
-      interviewType.includes("behavior")
-        ? "Behavioral"
-        : interviewType.includes("problem")
-          ? "Problem Solving"
-          : "Technical",
-  }));
-}
 
 function tryParseJSONLoose(raw) {
   if (!raw || typeof raw !== "string") return null;
@@ -163,18 +124,17 @@ export async function POST(req) {
       );
     }
 
-    const fallback = fallbackQuestions(jobPosition, type);
-
     const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY?.trim();
-    const model = process.env.OPENROUTER_MODEL?.trim();
+    const model = process.env.OPENROUTER_MODEL?.trim() || "google/gemini-2.5-flash";
 
-    if (!OPENROUTER_KEY || !model) {
+    if (!OPENROUTER_KEY) {
       return NextResponse.json(
-        { questions: fallback, fallback: true },
-        { status: 200 }
+        { error: "OpenRouter API key is missing. Please set OPENROUTER_API_KEY." },
+        { status: 400 }
       );
     }
 
+    const salt = Math.random().toString(36).substring(7);
     const prompt = `
 Return ONLY valid JSON:
 {
@@ -183,13 +143,17 @@ Return ONLY valid JSON:
   ]
 }
 
-Generate 3 to 5 questions for a ${duration}-minute ${type} interview.
+Generate an appropriate number of questions based on a duration of ${duration} minutes for a ${type} interview.
 Role: ${jobPosition}
 Job description: ${jobDescription}
 
 Rules:
+- The number of questions must scale proportionally with the interview duration of ${duration} minutes (approx. 1 question per 3 to 5 minutes of interview time. For example, 10 mins = 2-3 questions, 30 mins = 6-10 questions, 60 mins = 12-15 questions).
+- There is no arbitrary cap (like 3 to 5). Generate as many as needed to fill the duration.
 - question must be a single interview question
 - type must be one of: Technical, Behavioral, Problem Solving, Experience
+- Every question must be uniquely tweaked, highly specific to the job description, and creative. Avoid repeating the same questions across generations.
+- Seed value (for variety): ${salt}
 - no markdown
 - no explanation
 - no extra keys
@@ -203,8 +167,8 @@ Rules:
         },
         { role: "user", content: prompt },
       ],
-      temperature: 0.2,
-      max_tokens: 500,
+      temperature: 0.8,
+      max_tokens: 1500,
     };
 
     const resp = await callOpenRouter(model, payload, OPENROUTER_KEY, 120000);
@@ -215,11 +179,10 @@ Rules:
       console.error("OpenRouter error:", resp.status, rawText);
       return NextResponse.json(
         {
-          questions: fallback,
-          fallback: true,
+          error: "OpenRouter service error",
           upstreamError: rawText || `OpenRouter error ${resp.status}`,
         },
-        { status: 200 }
+        { status: resp.status || 502 }
       );
     }
 
@@ -231,11 +194,10 @@ Rules:
       console.error("No valid questions parsed:", assistantText);
       return NextResponse.json(
         {
-          questions: fallback,
-          fallback: true,
-          upstreamError: "AI returned invalid question format",
+          error: "AI returned invalid question format",
+          upstreamError: assistantText || "No readable content",
         },
-        { status: 200 }
+        { status: 502 }
       );
     }
 
@@ -244,11 +206,9 @@ Rules:
     console.error("ai-model route failed:", err);
     return NextResponse.json(
       {
-        questions: fallbackQuestions("Java Developer", "technical"),
-        fallback: true,
         error: err?.message || "AI service failed",
       },
-      { status: 200 }
+      { status: 500 }
     );
   }
 }

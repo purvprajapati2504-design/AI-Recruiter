@@ -11,6 +11,11 @@ function notify(message) {
   else toast(message);
 }
 
+const fallbackSvgDataUri = (() => {
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 160 160'><rect fill='%23F3F4F6' width='160' height='160'/><g fill='%239CA3AF'><circle cx='80' cy='54' r='28'/><rect x='30' y='92' width='100' height='40' rx='20'/></g></svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+})();
+
 function normalizeAuthUser(authUser) {
   const meta = authUser?.user_metadata ?? {};
   const creditsValue =
@@ -27,7 +32,7 @@ function normalizeAuthUser(authUser) {
       meta.given_name ||
       meta.nickname ||
       (authUser?.email ? authUser.email.split("@")[0] : "User"),
-    picture: meta.avatar_url || meta.picture || "/default-avatar.png",
+    picture: meta.avatar_url || meta.picture || fallbackSvgDataUri,
     credits: Number.isFinite(creditsValue) ? creditsValue : 0,
     created_at: authUser?.created_at ?? null,
   };

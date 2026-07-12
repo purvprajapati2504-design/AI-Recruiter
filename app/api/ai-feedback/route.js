@@ -92,7 +92,7 @@ async function callOpenAI(prompt, key) {
 async function callOpenRouter(prompt, key) {
   if (!key) throw makeSerializableError({ provider: "openrouter", message: "Missing OpenRouter API key" });
   const body = {
-    model: process.env.OPENROUTER_MODEL ?? "mistralai/mistral-7b-instruct",
+    model: process.env.OPENROUTER_MODEL ?? "google/gemini-2.5-flash",
     messages: [
       { role: "system", content: "You are an expert interview evaluator. Always respond with valid JSON only, no markdown or explanation." },
       { role: "user", content: prompt }
@@ -126,7 +126,9 @@ Return ONLY valid JSON (no markdown, no code blocks, no explanation). Use this e
       "technicalSkills": <number 0-10>,
       "communication": <number 0-10>,
       "problemSolving": <number 0-10>,
-      "experience": <number 0-10>
+      "experience": <number 0-10>,
+      "confidence": <number 0-10>,
+      "overall": <number 0-10>
     },
     "summary": "<2-3 sentence performance summary>",
     "recommendation": <true or false>,
@@ -186,7 +188,9 @@ function createFallbackFeedback(msg = "No conversation pairs were provided.", pa
         technicalSkills: baseScore,
         communication: baseScore,
         problemSolving: baseScore,
-        experience: baseScore
+        experience: baseScore,
+        confidence: baseScore,
+        overall: baseScore
       },
       summary: msg,
       recommendation: answerRate >= 0.5,
@@ -270,14 +274,19 @@ export async function POST(req) {
 
     if (!pairs.length) {
       const fallback = createFallbackFeedback("No conversation pairs were provided.", pairs);
-      await upsertFeedbackToSupabase({
+      const dbResult = await upsertFeedbackToSupabase({
         user_name,
         user_email,
         interview_id,
         feedbackObj: fallback,
         recommended: fallback.feedback?.recommendation ?? false
       });
-      return NextResponse.json({ provider: "none", content: JSON.stringify(fallback), parsed: fallback }, { status: 200 });
+      return NextResponse.json({
+        provider: "none",
+        content: JSON.stringify(fallback),
+        parsed: fallback,
+        saved: !!(dbResult && !dbResult.error)
+      }, { status: 200 });
     }
 
     const prompt = buildPromptFromPairs(pairs, jobPosition, candidateName);
@@ -309,14 +318,19 @@ export async function POST(req) {
 
     if (!content) {
       const fallback = createFallbackFeedback("No AI provider available. Basic scoring applied.", pairs);
-      await upsertFeedbackToSupabase({
+      const dbResult = await upsertFeedbackToSupabase({
         user_name,
         user_email,
         interview_id,
         feedbackObj: fallback,
         recommended: fallback.feedback?.recommendation ?? false
       });
-      return NextResponse.json({ provider: "none", content: JSON.stringify(fallback), parsed: fallback }, { status: 200 });
+      return NextResponse.json({
+        provider: "none",
+        content: JSON.stringify(fallback),
+        parsed: fallback,
+        saved: !!(dbResult && !dbResult.error)
+      }, { status: 200 });
     }
 
     const parsed = extractJsonFromResponse(content);
@@ -333,7 +347,7 @@ export async function POST(req) {
       finalParsed = fallback;
     }
 
-    await upsertFeedbackToSupabase({
+    const dbResult = await upsertFeedbackToSupabase({
       user_name,
       user_email,
       interview_id,
@@ -345,25 +359,29 @@ export async function POST(req) {
       provider,
       content: JSON.stringify(finalParsed),
       parsed: finalParsed,
-      rawAiResponse: String(rawAiResponse ?? content).slice(0, 10000)
+      rawAiResponse: String(rawAiResponse ?? content).slice(0, 10000),
+      saved: !!(dbResult && !dbResult.error)
     }, { status: 200 });
 
   } catch (err) {
     const fallback = createFallbackFeedback("Feedback generation failed due to server error.", []);
+    let saved = false;
     try {
-      await upsertFeedbackToSupabase({
+      const dbResult = await upsertFeedbackToSupabase({
         user_name: null,
         user_email: null,
         interview_id: null,
         feedbackObj: fallback,
         recommended: fallback.feedback?.recommendation ?? false
       });
+      saved = !!(dbResult && !dbResult.error);
     } catch {}
     return NextResponse.json({
       provider: "none",
       content: JSON.stringify(fallback),
       parsed: fallback,
-      error: makeSerializableError(err)
+      error: makeSerializableError(err),
+      saved
     }, { status: 200 });
   }
 }

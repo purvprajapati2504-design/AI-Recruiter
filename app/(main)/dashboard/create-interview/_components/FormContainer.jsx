@@ -11,12 +11,13 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { InterviewType } from '@/lib/services/Constants'
-import { ArrowRight } from 'lucide-react'
+import { ArrowRight, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 
 function FormContainer({ onHandleInputChange, GoToNext }) {
 
   const [interviewType, setInterviewType] = useState([]);
+  const [resumeFile, setResumeFile] = useState(null);
 
   useEffect(() => {
     if (interviewType.length) {
@@ -31,6 +32,14 @@ function FormContainer({ onHandleInputChange, GoToNext }) {
     } else {
       const result = interviewType.filter(item => item != type);
       setInterviewType(result);
+    }
+  };
+
+  const handleResumeUpload = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      setResumeFile(file);
+      onHandleInputChange('resume', file);
     }
   };
 
@@ -89,6 +98,24 @@ function FormContainer({ onHandleInputChange, GoToNext }) {
               <span>{type.title}</span>
             </div>
           ))}
+        </div>
+      </div>
+
+      <div className='mt-5'>
+        <h2 className='text-sm font-medium'>Resume <span className='text-red-500'>*</span></h2>
+        <div className='mt-2'>
+          <Input
+            type="file"
+            accept=".pdf,.doc,.docx"
+            onChange={handleResumeUpload}
+            className="cursor-pointer"
+            required
+          />
+          {resumeFile && (
+            <p className='text-xs text-gray-500 mt-1'>
+              Selected: {resumeFile.name}
+            </p>
+          )}
         </div>
       </div>
 
